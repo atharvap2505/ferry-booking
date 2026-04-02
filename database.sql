@@ -6,6 +6,7 @@ DROP TABLE IF EXISTS ROUTES;
 DROP TABLE IF EXISTS USERS;
 DROP TABLE IF EXISTS PORTS;
 DROP TABLE IF EXISTS FERRY_OPERATORS;
+DROP TABLE IF EXISTS AUDIT_LOG;
 
 CREATE TABLE FERRY_OPERATORS (
     operator_id INTEGER PRIMARY KEY,
@@ -70,6 +71,15 @@ CREATE TABLE BOOKINGS (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (userID) REFERENCES USERS(userID),
     FOREIGN KEY (routeID) REFERENCES ROUTES(route_id)
+);
+
+CREATE TABLE AUDIT_LOG (
+    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('INSERT', 'UPDATE', 'DELETE')),
+    details TEXT,
+    changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 INSERT INTO FERRY_OPERATORS (operator_id, name, operator_code, company_code) VALUES
@@ -200,5 +210,202 @@ INSERT INTO BOOKINGS (
 ) VALUES
     ('BK001', 'USER001', 101, '2026-03-30', 'Confirmed', 1499.00, 'UPI'),
     ('BK002', 'UPD001', 102, '2026-03-30', 'Pending', 1299.00, 'Card');
+
+CREATE TRIGGER trg_users_set_updated_at
+AFTER UPDATE ON USERS
+FOR EACH ROW
+BEGIN
+    UPDATE USERS
+    SET updated_at = CURRENT_TIMESTAMP
+    WHERE userID = NEW.userID;
+END;
+
+CREATE TRIGGER trg_routes_set_updated_at
+AFTER UPDATE ON ROUTES
+FOR EACH ROW
+BEGIN
+    UPDATE ROUTES
+    SET updated_at = CURRENT_TIMESTAMP
+    WHERE route_id = NEW.route_id;
+END;
+
+CREATE TRIGGER trg_bookings_set_updated_at
+AFTER UPDATE ON BOOKINGS
+FOR EACH ROW
+BEGIN
+    UPDATE BOOKINGS
+    SET updated_at = CURRENT_TIMESTAMP
+    WHERE bookingID = NEW.bookingID;
+END;
+
+CREATE TRIGGER trg_bookings_validate_insert
+BEFORE INSERT ON BOOKINGS
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN (SELECT status FROM ROUTES WHERE route_id = NEW.routeID) = 'Cancelled'
+        THEN RAISE(ABORT, 'Cannot book a cancelled route')
+    END;
+
+    SELECT CASE
+        WHEN NEW.status IN ('Pending', 'Confirmed')
+             AND (
+                SELECT COUNT(*)
+                FROM BOOKINGS b
+                WHERE b.routeID = NEW.routeID
+                  AND b.status IN ('Pending', 'Confirmed')
+             ) >= (
+                SELECT capacity FROM ROUTES WHERE route_id = NEW.routeID
+             )
+        THEN RAISE(ABORT, 'Route capacity reached')
+    END;
+END;
+
+CREATE TRIGGER trg_bookings_validate_update
+BEFORE UPDATE ON BOOKINGS
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN OLD.status = 'Cancelled' AND NEW.status IN ('Pending', 'Confirmed')
+        THEN RAISE(ABORT, 'Cancelled booking cannot be reactivated')
+    END;
+
+    SELECT CASE
+        WHEN (SELECT status FROM ROUTES WHERE route_id = NEW.routeID) = 'Cancelled'
+             AND NEW.status IN ('Pending', 'Confirmed')
+        THEN RAISE(ABORT, 'Cannot keep active booking on cancelled route')
+    END;
+
+    SELECT CASE
+        WHEN NEW.status IN ('Pending', 'Confirmed')
+             AND (
+                SELECT COUNT(*)
+                FROM BOOKINGS b
+                WHERE b.routeID = NEW.routeID
+                  AND b.status IN ('Pending', 'Confirmed')
+                  AND b.bookingID <> OLD.bookingID
+             ) >= (
+                SELECT capacity FROM ROUTES WHERE route_id = NEW.routeID
+             )
+        THEN RAISE(ABORT, 'Route capacity reached')
+    END;
+END;
+
+CREATE TRIGGER trg_users_audit_insert
+AFTER INSERT ON USERS
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'USERS',
+        NEW.userID,
+        'INSERT',
+        'email=' || NEW.email || ';role=' || NEW.role
+    );
+END;
+
+CREATE TRIGGER trg_users_audit_update
+AFTER UPDATE ON USERS
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'USERS',
+        NEW.userID,
+        'UPDATE',
+        'old_role=' || OLD.role || ';new_role=' || NEW.role || ';old_email=' || OLD.email || ';new_email=' || NEW.email
+    );
+END;
+
+CREATE TRIGGER trg_users_audit_delete
+AFTER DELETE ON USERS
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'USERS',
+        OLD.userID,
+        'DELETE',
+        'email=' || OLD.email || ';role=' || OLD.role
+    );
+END;
+
+CREATE TRIGGER trg_routes_audit_insert
+AFTER INSERT ON ROUTES
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'ROUTES',
+        CAST(NEW.route_id AS TEXT),
+        'INSERT',
+        'route=' || NEW.route_number || ';status=' || NEW.status
+    );
+END;
+
+CREATE TRIGGER trg_routes_audit_update
+AFTER UPDATE ON ROUTES
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'ROUTES',
+        CAST(NEW.route_id AS TEXT),
+        'UPDATE',
+        'old_status=' || OLD.status || ';new_status=' || NEW.status || ';old_fare=' || CAST(OLD.fare AS TEXT) || ';new_fare=' || CAST(NEW.fare AS TEXT)
+    );
+END;
+
+CREATE TRIGGER trg_routes_audit_delete
+AFTER DELETE ON ROUTES
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'ROUTES',
+        CAST(OLD.route_id AS TEXT),
+        'DELETE',
+        'route=' || OLD.route_number || ';status=' || OLD.status
+    );
+END;
+
+CREATE TRIGGER trg_bookings_audit_insert
+AFTER INSERT ON BOOKINGS
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'BOOKINGS',
+        NEW.bookingID,
+        'INSERT',
+        'user=' || NEW.userID || ';route=' || CAST(NEW.routeID AS TEXT) || ';status=' || NEW.status
+    );
+END;
+
+CREATE TRIGGER trg_bookings_audit_update
+AFTER UPDATE ON BOOKINGS
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'BOOKINGS',
+        NEW.bookingID,
+        'UPDATE',
+        'old_status=' || OLD.status || ';new_status=' || NEW.status || ';old_route=' || CAST(OLD.routeID AS TEXT) || ';new_route=' || CAST(NEW.routeID AS TEXT)
+    );
+END;
+
+CREATE TRIGGER trg_bookings_audit_delete
+AFTER DELETE ON BOOKINGS
+FOR EACH ROW
+BEGIN
+    INSERT INTO AUDIT_LOG (entity_type, entity_id, action, details)
+    VALUES (
+        'BOOKINGS',
+        OLD.bookingID,
+        'DELETE',
+        'user=' || OLD.userID || ';route=' || CAST(OLD.routeID AS TEXT) || ';status=' || OLD.status
+    );
+END;
 
 COMMIT;

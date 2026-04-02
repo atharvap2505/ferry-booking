@@ -69,7 +69,30 @@ Future<void> initDatabase() async {
     }
   }
 
-  final shouldCopyFresh = !await hasFerrySchema(path) || !await hasExpectedRouteSeed(path);
+  Future<bool> hasAuditAndTriggerSupport(String dbPath) async {
+    if (!await File(dbPath).exists()) {
+      return false;
+    }
+    final tempDb = await openDatabase(dbPath, readOnly: true);
+    try {
+      final auditTable = await tempDb.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='AUDIT_LOG'",
+      );
+      final trigger = await tempDb.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='trg_bookings_validate_insert'",
+      );
+      return auditTable.isNotEmpty && trigger.isNotEmpty;
+    } catch (_) {
+      return false;
+    } finally {
+      await tempDb.close();
+    }
+  }
+
+  final shouldCopyFresh =
+      !await hasFerrySchema(path) ||
+      !await hasExpectedRouteSeed(path) ||
+      !await hasAuditAndTriggerSupport(path);
   if (shouldCopyFresh && await File(path).exists()) {
     await File(path).delete();
   }
@@ -106,6 +129,17 @@ void showPopup(BuildContext context, String title, String content) {
       ],
     ),
   );
+}
+
+String formatDbError(Object error) {
+  final raw = error.toString();
+  if (raw.contains('DatabaseException')) {
+    return raw
+        .replaceAll('DatabaseException(', '')
+        .replaceAll(')', '')
+        .trim();
+  }
+  return raw;
 }
 
 class FerryBookingApp extends StatelessWidget {
@@ -153,6 +187,7 @@ class FerryBookingApp extends StatelessWidget {
         '/payment': (_) => PaymentPage(),
         '/booking_history': (_) => BookingHistoryPage(),
         '/all_bookings': (_) => AllBookingsPage(),
+        '/audit_log': (_) => AuditLogPage(),
         '/profile': (_) => ProfilePage(),
       },
       initialRoute: '/',
@@ -360,14 +395,21 @@ class _SignUpPageState extends State<SignUpPage> {
       'updated_at': DateTime.now().toIso8601String(),
     };
 
-    await db.insert('USERS', newUser);
-    await fetchUsers();
-    currentUser = newUser;
-    if (!mounted) {
-      return;
+    try {
+      await db.insert('USERS', newUser);
+      await fetchUsers();
+      currentUser = newUser;
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Success', 'Account created. You are now logged in.');
+      Navigator.pushNamedAndRemoveUntil(context, '/route_search', (_) => false);
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Signup Failed', formatDbError(e));
     }
-    showPopup(context, 'Success', 'Account created. You are now logged in.');
-    Navigator.pushNamedAndRemoveUntil(context, '/route_search', (_) => false);
   }
 
   @override
@@ -526,6 +568,15 @@ class AdminDashboardPage extends StatelessWidget {
               icon: Icons.list_alt_rounded,
               onTap: () {
                 Navigator.pushNamed(context, '/all_bookings');
+              },
+            ),
+            _adminActionCard(
+              context: context,
+              title: 'Audit Log',
+              subtitle: 'Review trigger-captured DB changes',
+              icon: Icons.history_edu_outlined,
+              onTap: () {
+                Navigator.pushNamed(context, '/audit_log');
               },
             ),
             _adminActionCard(
@@ -692,23 +743,30 @@ class _RouteManagementPageState extends State<RouteManagementPage> {
                       'updated_at': DateTime.now().toIso8601String(),
                     };
 
-                    if (existing == null) {
-                      final nextIdRows = await db.rawQuery('SELECT IFNULL(MAX(route_id), 100) + 1 AS next_id FROM ROUTES');
-                      final nextId = nextIdRows.first['next_id'] as int;
-                      await db.insert('ROUTES', {
-                        ...payload,
-                        'route_id': nextId,
-                        'created_at': DateTime.now().toIso8601String(),
-                      });
-                    } else {
-                      await db.update('ROUTES', payload, where: 'route_id = ?', whereArgs: [existing['route_id']]);
-                    }
+                    try {
+                      if (existing == null) {
+                        final nextIdRows = await db.rawQuery('SELECT IFNULL(MAX(route_id), 100) + 1 AS next_id FROM ROUTES');
+                        final nextId = nextIdRows.first['next_id'] as int;
+                        await db.insert('ROUTES', {
+                          ...payload,
+                          'route_id': nextId,
+                          'created_at': DateTime.now().toIso8601String(),
+                        });
+                      } else {
+                        await db.update('ROUTES', payload, where: 'route_id = ?', whereArgs: [existing['route_id']]);
+                      }
 
-                    if (!mounted) {
-                      return;
+                      if (!mounted) {
+                        return;
+                      }
+                      Navigator.pop(dialogContext);
+                      await fetchRoutes();
+                    } catch (e) {
+                      if (!mounted) {
+                        return;
+                      }
+                      showPopup(context, 'Route Save Failed', formatDbError(e));
                     }
-                    Navigator.pop(dialogContext);
-                    await fetchRoutes();
                   },
                   child: Text(existing == null ? 'Create' : 'Save'),
                 ),
@@ -721,9 +779,16 @@ class _RouteManagementPageState extends State<RouteManagementPage> {
   }
 
   Future<void> _deleteRoute(int routeId) async {
-    await db.delete('BOOKINGS', where: 'routeID = ?', whereArgs: [routeId]);
-    await db.delete('ROUTES', where: 'route_id = ?', whereArgs: [routeId]);
-    await fetchRoutes();
+    try {
+      await db.delete('BOOKINGS', where: 'routeID = ?', whereArgs: [routeId]);
+      await db.delete('ROUTES', where: 'route_id = ?', whereArgs: [routeId]);
+      await fetchRoutes();
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Delete Failed', formatDbError(e));
+    }
   }
 
   @override
@@ -841,22 +906,29 @@ class _UserManagementPageState extends State<UserManagementPage> {
                       'updated_at': DateTime.now().toIso8601String(),
                     };
 
-                    if (existing == null) {
-                      await db.insert('USERS', {
-                        ...payload,
-                        'userID': 'USR${DateTime.now().millisecondsSinceEpoch}',
-                        'created_at': DateTime.now().toIso8601String(),
-                      });
-                    } else {
-                      await db.update('USERS', payload, where: 'userID = ?', whereArgs: [existing['userID']]);
-                    }
+                    try {
+                      if (existing == null) {
+                        await db.insert('USERS', {
+                          ...payload,
+                          'userID': 'USR${DateTime.now().millisecondsSinceEpoch}',
+                          'created_at': DateTime.now().toIso8601String(),
+                        });
+                      } else {
+                        await db.update('USERS', payload, where: 'userID = ?', whereArgs: [existing['userID']]);
+                      }
 
-                    await fetchUsers();
-                    if (!mounted) {
-                      return;
+                      await fetchUsers();
+                      if (!mounted) {
+                        return;
+                      }
+                      setState(() {});
+                      Navigator.pop(dialogContext);
+                    } catch (e) {
+                      if (!mounted) {
+                        return;
+                      }
+                      showPopup(context, 'User Save Failed', formatDbError(e));
                     }
-                    setState(() {});
-                    Navigator.pop(dialogContext);
                   },
                   child: Text(existing == null ? 'Create' : 'Save'),
                 ),
@@ -873,11 +945,18 @@ class _UserManagementPageState extends State<UserManagementPage> {
       showPopup(context, 'Not allowed', 'You cannot delete the currently logged-in user.');
       return;
     }
-    await db.delete('BOOKINGS', where: 'userID = ?', whereArgs: [userId]);
-    await db.delete('USERS', where: 'userID = ?', whereArgs: [userId]);
-    await fetchUsers();
-    if (mounted) {
-      setState(() {});
+    try {
+      await db.delete('BOOKINGS', where: 'userID = ?', whereArgs: [userId]);
+      await db.delete('USERS', where: 'userID = ?', whereArgs: [userId]);
+      await fetchUsers();
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Delete Failed', formatDbError(e));
     }
   }
 
@@ -1368,28 +1447,35 @@ class _PaymentPageState extends State<PaymentPage> {
   Future<void> confirmPayment(Map<String, dynamic> details) async {
     final bookingId = 'BK${DateTime.now().millisecondsSinceEpoch}';
 
-    await db.insert('BOOKINGS', {
-      'bookingID': bookingId,
-      'userID': currentUser?['userID'],
-      'routeID': details['routeID'],
-      'bookingDate': details['bookingDate'],
-      'status': 'Confirmed',
-      'total_fare': details['fare'],
-      'payment_method': selectedPaymentMethod,
-      'created_at': DateTime.now().toIso8601String(),
-      'updated_at': DateTime.now().toIso8601String(),
-    });
+    try {
+      await db.insert('BOOKINGS', {
+        'bookingID': bookingId,
+        'userID': currentUser?['userID'],
+        'routeID': details['routeID'],
+        'bookingDate': details['bookingDate'],
+        'status': 'Confirmed',
+        'total_fare': details['fare'],
+        'payment_method': selectedPaymentMethod,
+        'created_at': DateTime.now().toIso8601String(),
+        'updated_at': DateTime.now().toIso8601String(),
+      });
 
-    if (!mounted) {
-      return;
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        paymentStatus = 'Confirmed';
+      });
+
+      showPopup(context, 'Success', 'Booking confirmed with ID: $bookingId');
+      Navigator.pop(context);
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Booking Failed', formatDbError(e));
     }
-
-    setState(() {
-      paymentStatus = 'Confirmed';
-    });
-
-    showPopup(context, 'Success', 'Booking confirmed with ID: $bookingId');
-    Navigator.pop(context);
   }
 
   @override
@@ -1479,29 +1565,43 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
   }
 
   Future<void> cancelBooking(String bookingId) async {
-    await db.update(
-      'BOOKINGS',
-      {
-        'status': 'Cancelled',
-        'updated_at': DateTime.now().toIso8601String(),
-      },
-      where: 'bookingID = ?',
-      whereArgs: [bookingId],
-    );
-    await loadBookings();
+    try {
+      await db.update(
+        'BOOKINGS',
+        {
+          'status': 'Cancelled',
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'bookingID = ?',
+        whereArgs: [bookingId],
+      );
+      await loadBookings();
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Update Failed', formatDbError(e));
+    }
   }
 
   Future<void> markConfirmed(String bookingId) async {
-    await db.update(
-      'BOOKINGS',
-      {
-        'status': 'Confirmed',
-        'updated_at': DateTime.now().toIso8601String(),
-      },
-      where: 'bookingID = ?',
-      whereArgs: [bookingId],
-    );
-    await loadBookings();
+    try {
+      await db.update(
+        'BOOKINGS',
+        {
+          'status': 'Confirmed',
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'bookingID = ?',
+        whereArgs: [bookingId],
+      );
+      await loadBookings();
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Update Failed', formatDbError(e));
+    }
   }
 
   @override
@@ -1704,6 +1804,66 @@ class _AllBookingsPageState extends State<AllBookingsPage> {
   }
 }
 
+class AuditLogPage extends StatefulWidget {
+  const AuditLogPage({super.key});
+
+  @override
+  State<AuditLogPage> createState() => _AuditLogPageState();
+}
+
+class _AuditLogPageState extends State<AuditLogPage> {
+  List<Map<String, dynamic>> auditRows = [];
+
+  Future<void> loadAuditLog() async {
+    try {
+      auditRows = await db.query('AUDIT_LOG', orderBy: 'changed_at DESC, audit_id DESC');
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Audit Log Error', formatDbError(e));
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    loadAuditLog();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: FerryTopNavBar(title: 'Audit Log'),
+      body: auditRows.isEmpty
+          ? Center(child: Text('No audit events found.'))
+          : RefreshIndicator(
+              onRefresh: loadAuditLog,
+              child: ListView.builder(
+                itemCount: auditRows.length,
+                itemBuilder: (_, index) {
+                  final row = auditRows[index];
+                  return Card(
+                    margin: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    child: ListTile(
+                      title: Text('${row['entity_type']} ${row['action']} (#${row['entity_id']})'),
+                      subtitle: Text(
+                        '${row['details'] ?? ''}\n'
+                        'At: ${row['changed_at']}',
+                      ),
+                      isThreeLine: true,
+                    ),
+                  );
+                },
+              ),
+            ),
+    );
+  }
+}
+
 class ProfileEditPage extends StatefulWidget {
   final Map<String, dynamic> user;
 
@@ -1735,23 +1895,30 @@ class _ProfileEditPageState extends State<ProfileEditPage> {
   }
 
   Future<void> saveProfile() async {
-    await db.update(
-      'USERS',
-      {
-        'name': nameController.text.trim(),
-        'email': emailController.text.trim(),
-        'phone': phoneController.text.trim(),
-        'updated_at': DateTime.now().toIso8601String(),
-      },
-      where: 'userID = ?',
-      whereArgs: [widget.user['userID']],
-    );
+    try {
+      await db.update(
+        'USERS',
+        {
+          'name': nameController.text.trim(),
+          'email': emailController.text.trim(),
+          'phone': phoneController.text.trim(),
+          'updated_at': DateTime.now().toIso8601String(),
+        },
+        where: 'userID = ?',
+        whereArgs: [widget.user['userID']],
+      );
 
-    await fetchUsers();
-    if (!mounted) {
-      return;
+      await fetchUsers();
+      if (!mounted) {
+        return;
+      }
+      Navigator.pop(context);
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+      showPopup(context, 'Profile Update Failed', formatDbError(e));
     }
-    Navigator.pop(context);
   }
 
   @override
